@@ -7,7 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use deck_gl::glam::{DMat4, DVec3, DVec4};
-use deck_gl::Viewport;
+use deck_gl::{ProjectionMode, Viewport};
+use math_gl::culling::{
+    make_oriented_bounding_box_from_points, AxisAlignedBoundingBox, BoundingVolume, CullingVolume,
+    Intersection, OrientedBoundingBox, Plane,
+};
 use math_gl::web_mercator::lng_lat_to_world;
 
 pub const TILE_SIZE: f64 = 512.0;
@@ -139,77 +143,84 @@ impl Default for TilesetOptions {
     }
 }
 
-/// A plane `normal . p + distance >= 0` on the inside.
-#[derive(Clone, Copy, Debug)]
-struct Plane {
-    normal: DVec3,
-    distance: f64,
-}
+/// Sample points of a tile, in tile units, for its bounding volume in a projection that is not
+/// Web Mercator: deck.gl's `REF_POINTS_5`, the four corners and the center.
+const REF_POINTS_5: [[f64; 2]; 5] = [[0.5, 0.5], [0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+/// `REF_POINTS_9`: the corners, the center and the four mid points.
+const REF_POINTS_9: [[f64; 2]; 9] = [
+    [0.5, 0.5],
+    [0.0, 0.0],
+    [0.0, 1.0],
+    [1.0, 0.0],
+    [1.0, 1.0],
+    [0.0, 0.5],
+    [0.5, 0.0],
+    [1.0, 0.5],
+    [0.5, 1.0],
+];
+/// `REF_POINTS_11`: two more points on the equator, for the top tile.
+const REF_POINTS_11: [[f64; 2]; 11] = [
+    [0.5, 0.5],
+    [0.0, 0.0],
+    [0.0, 1.0],
+    [1.0, 0.0],
+    [1.0, 1.0],
+    [0.0, 0.5],
+    [0.5, 0.0],
+    [1.0, 0.5],
+    [0.5, 1.0],
+    [0.25, 0.5],
+    [0.75, 0.5],
+];
 
-/// The six planes of a viewport's frustum in common space.
-fn frustum_planes(view_projection: &DMat4) -> [Plane; 6] {
+/// The six planes of a viewport's frustum in common space, normals pointing inside.
+fn frustum_planes(view_projection: &DMat4) -> CullingVolume {
     let m = view_projection;
     let row = |i: usize| DVec4::new(m.x_axis[i], m.y_axis[i], m.z_axis[i], m.w_axis[i]);
     let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
     let plane = |v: DVec4| {
         let n = v.truncate();
         let len = n.length().max(f64::EPSILON);
-        Plane {
-            normal: n / len,
-            distance: v.w / len,
-        }
+        Plane::new(n / len, v.w / len)
     };
-    [
+    CullingVolume::new(vec![
         plane(r3 + r0),
         plane(r3 - r0),
         plane(r3 + r1),
         plane(r3 - r1),
         plane(r3 + r2),
         plane(r3 - r2),
-    ]
+    ])
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Aabb {
-    min: DVec3,
-    max: DVec3,
+/// A tile's bounding volume: a box in Web Mercator common space, or one fitted to sample points
+/// on the globe.
+enum TileVolume {
+    Aligned(AxisAlignedBoundingBox),
+    Oriented(OrientedBoundingBox),
 }
 
-impl Aabb {
-    /// False when the box lies entirely outside one of the planes.
-    fn visible(&self, planes: &[Plane; 6]) -> bool {
-        planes.iter().all(|plane| {
-            // The corner furthest along the normal
-            let p = DVec3::new(
-                if plane.normal.x >= 0.0 {
-                    self.max.x
-                } else {
-                    self.min.x
-                },
-                if plane.normal.y >= 0.0 {
-                    self.max.y
-                } else {
-                    self.min.y
-                },
-                if plane.normal.z >= 0.0 {
-                    self.max.z
-                } else {
-                    self.min.z
-                },
-            );
-            plane.normal.dot(p) + plane.distance >= 0.0
-        })
+impl TileVolume {
+    fn visibility(&self, culling: &CullingVolume) -> Intersection {
+        match self {
+            Self::Aligned(b) => culling.compute_visibility(b),
+            Self::Oriented(b) => culling.compute_visibility(b),
+        }
     }
 
     fn distance_to(&self, point: DVec3) -> f64 {
-        let clamped = point.clamp(self.min, self.max);
-        (point - clamped).length()
+        match self {
+            Self::Aligned(b) => b.distance_to(point),
+            Self::Oriented(b) => b.distance_to(point),
+        }
     }
 }
 
 struct Traversal<'a> {
     viewport: &'a Viewport,
-    planes: [Plane; 6],
+    /// Whether the viewport is a globe, whose common space is not Web Mercator
+    globe: bool,
+    culling: CullingVolume,
     elevation: [f64; 2],
     min_z: u32,
     max_z: u32,
@@ -218,29 +229,78 @@ struct Traversal<'a> {
     world_offset: f64,
 }
 
-/// One node of the OSM quadtree walk.
-fn visit(node: TileIndex, t: &Traversal<'_>, out: &mut Vec<TileIndex>) -> bool {
+/// deck.gl's `OSMNode.getBoundingVolume`.
+fn bounding_volume(node: TileIndex, t: &Traversal<'_>) -> TileVolume {
+    if t.globe {
+        // At low zoom levels more samples are needed to bound the tile correctly
+        let ref_points: &[[f64; 2]] = match node.z {
+            0 => &REF_POINTS_11,
+            1 => &REF_POINTS_9,
+            _ => &REF_POINTS_5,
+        };
+        let [z_min, z_max] = t.elevation;
+        let mut positions = Vec::with_capacity(ref_points.len() * 2);
+        for [dx, dy] in ref_points {
+            // deck.gl passes the common space elevation range here as if it were meters
+            let [lng, lat] = osm_tile_to_lng_lat_f(node.x as f64 + dx, node.y as f64 + dy, node.z);
+            positions.push(t.viewport.project_position(DVec3::new(lng, lat, z_min)));
+            if z_min != z_max {
+                // Account for the elevation volume
+                positions.push(t.viewport.project_position(DVec3::new(lng, lat, z_max)));
+            }
+        }
+        return TileVolume::Oriented(make_oriented_bounding_box_from_points(&positions));
+    }
     let extent = TILE_SIZE / 2f64.powi(node.z as i32);
     let origin_x = node.x as f64 * extent + t.world_offset * TILE_SIZE;
     // deck.gl's common space is y up while OSM tiles count rows from the top
     let origin_y = TILE_SIZE - (node.y as f64 + 1.0) * extent;
+    TileVolume::Aligned(AxisAlignedBoundingBox::new(
+        DVec3::new(origin_x, origin_y, t.elevation[0]),
+        DVec3::new(origin_x + extent, origin_y + extent, t.elevation[1]),
+    ))
+}
+
+/// deck.gl's `OSMNode.beyondHorizon`: on the globe, whether the point of the tile closest to
+/// the camera faces away from it, hidden by the near hemisphere.
+fn beyond_horizon(node: TileIndex, t: &Traversal<'_>, elevation: f64) -> bool {
+    let c = t.viewport.camera_position;
+    let camera_lng = c.x.atan2(-c.y).to_degrees();
+    let camera_lat = (c.z / c.length()).asin().to_degrees();
+    let [west, north] = osm_tile_to_lng_lat(node.x, node.y, node.z);
+    let [east, south] = osm_tile_to_lng_lat(node.x + 1, node.y + 1, node.z);
+    let tile_center_lng = (west + east) / 2.0;
+    // JavaScript's `%` keeps the sign of the dividend, as Rust's does
+    let wrapped_camera_lng = tile_center_lng + ((camera_lng - tile_center_lng + 540.0) % 360.0 - 180.0);
+    let closest_lng = wrapped_camera_lng.clamp(west, east);
+    let closest_lat = camera_lat.clamp(south, north);
+    let closest = t
+        .viewport
+        .project_position(DVec3::new(closest_lng, closest_lat, elevation));
+    closest.dot(c) <= closest.length_squared()
+}
+
+/// One node of the OSM quadtree walk, deck.gl's `OSMNode.update`.
+fn visit(node: TileIndex, t: &Traversal<'_>, out: &mut Vec<TileIndex>) -> bool {
     if let Some([min_x, min_y, max_x, max_y]) = t.bounds {
+        let extent = TILE_SIZE / 2f64.powi(node.z as i32);
         let (x0, y0) = (node.x as f64 * extent, node.y as f64 * extent);
         if x0 >= max_x || x0 + extent <= min_x || y0 >= max_y || y0 + extent <= min_y {
             return false;
         }
     }
-    let aabb = Aabb {
-        min: DVec3::new(origin_x, origin_y, t.elevation[0]),
-        max: DVec3::new(origin_x + extent, origin_y + extent, t.elevation[1]),
-    };
-    if !aabb.visible(&t.planes) {
+    let volume = bounding_volume(node, t);
+    if volume.visibility(&t.culling) == Intersection::Outside {
+        return false;
+    }
+    // Globe: reject tiles occluded by the near hemisphere
+    if t.globe && beyond_horizon(node, t, t.elevation[1]) {
         return false;
     }
     let mut z = node.z;
     if z < t.max_z && z >= t.min_z {
         // Level of detail from the distance to the camera, in viewport heights
-        let distance = aabb.distance_to(t.viewport.camera_position) * t.viewport.scale / t.viewport.height;
+        let distance = volume.distance_to(t.viewport.camera_position) * t.viewport.scale / t.viewport.height;
         if distance > 1.0 {
             z += distance.log2().floor() as u32;
         }
@@ -255,14 +315,16 @@ fn visit(node: TileIndex, t: &Traversal<'_>, out: &mut Vec<TileIndex>) -> bool {
     true
 }
 
+/// deck.gl's `getOSMTileIndices`.
 fn osm_tile_indices(viewport: &Viewport, z: u32, opts: &TilesetOptions) -> Vec<TileIndex> {
+    let globe = viewport.projection_mode() == ProjectionMode::Globe;
     let units_per_meter = viewport.distance_scales.units_per_meter.z;
     let elevation = opts
         .z_range
         .map(|[min, max]| [min * units_per_meter, max * units_per_meter])
         .unwrap_or([0.0, 0.0]);
-    // Always load the current zoom unless the view is pitched far, then coarser far away
-    let min_z = if viewport.pitch <= 60.0 { z } else { 0 };
+    // Always load the current zoom on a map unless it is pitched far, then coarser far away
+    let min_z = if !globe && viewport.pitch <= 60.0 { z } else { 0 };
     let bounds = opts.extent.map(|[min_lng, min_lat, max_lng, max_lat]| {
         let top_left = lng_lat_to_world([min_lng, max_lat]);
         let bottom_right = lng_lat_to_world([max_lng, min_lat]);
@@ -274,10 +336,10 @@ fn osm_tile_indices(viewport: &Viewport, z: u32, opts: &TilesetOptions) -> Vec<T
         ]
     });
     let mut result = Vec::new();
-    let planes = frustum_planes(&viewport.view_projection_matrix);
     let mut traversal = Traversal {
         viewport,
-        planes,
+        globe,
+        culling: frustum_planes(&viewport.view_projection_matrix),
         elevation,
         min_z,
         max_z: z,
@@ -285,9 +347,9 @@ fn osm_tile_indices(viewport: &Viewport, z: u32, opts: &TilesetOptions) -> Vec<T
         world_offset: 0.0,
     };
     visit(TileIndex::new(0, 0, 0), &traversal, &mut result);
-    // Repeated world copies across the antimeridian
+    // Repeated world copies across the antimeridian, on a map only
     let view_bounds = viewport.get_bounds(0.0);
-    if view_bounds[0] < -180.0 || view_bounds[2] > 180.0 {
+    if !globe && (view_bounds[0] < -180.0 || view_bounds[2] > 180.0) {
         let min_offset = ((view_bounds[0] + 180.0) / 360.0).floor().max(-3.0) as i32;
         let max_offset = ((view_bounds[2] - 180.0) / 360.0).ceil().min(3.0) as i32;
         for offset in min_offset..=max_offset {
@@ -366,9 +428,14 @@ pub fn get_tile_indices(viewport: &Viewport, opts: &TilesetOptions) -> Vec<TileI
 
 /// Longitude and latitude of the top left corner of an OSM tile.
 pub fn osm_tile_to_lng_lat(x: i64, y: i64, z: u32) -> [f64; 2] {
+    osm_tile_to_lng_lat_f(x as f64, y as f64, z)
+}
+
+/// deck.gl's `osmTile2lngLat` at a fractional tile position.
+fn osm_tile_to_lng_lat_f(x: f64, y: f64, z: u32) -> [f64; 2] {
     let scale = 2f64.powi(z as i32);
-    let lng = x as f64 / scale * 360.0 - 180.0;
-    let n = std::f64::consts::PI - 2.0 * std::f64::consts::PI * y as f64 / scale;
+    let lng = x / scale * 360.0 - 180.0;
+    let n = std::f64::consts::PI - 2.0 * std::f64::consts::PI * y / scale;
     let lat = 180.0 / std::f64::consts::PI * (0.5 * (n.exp() - (-n).exp())).atan();
     [lng, lat]
 }
@@ -723,6 +790,59 @@ mod tests {
             pitched.iter().any(|t| t.z < 6) && pitched.iter().any(|t| t.z == 6),
             "{pitched:?}"
         );
+    }
+
+    #[test]
+    fn globe_tiles_follow_deck_gl() {
+        // deck.gl's `getTileIndices` "globe" case: on the globe the tiles are culled against
+        // boxes fitted to points on the sphere, the far side is dropped behind the horizon, and
+        // tiles away from the camera come at a coarser zoom
+        let viewport = deck_gl::View::Globe(deck_gl::GlobeViewProps::default()).make_viewport(
+            &deck_gl::AnyViewState::Globe(ViewState {
+                longitude: -6.0,
+                latitude: 58.0,
+                zoom: 2.0,
+                pitch: 0.0,
+                bearing: 0.0,
+            }),
+            400.0,
+            400.0,
+        );
+        assert_eq!(viewport.projection_mode(), ProjectionMode::Globe);
+        let mut ids: Vec<String> = get_tile_indices(&viewport, &TilesetOptions::default())
+            .iter()
+            .map(|t| format!("{},{},{}", t.x, t.y, t.z))
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            ["0,1,1", "0,1,2", "1,0,2", "1,1,1", "1,1,2", "2,0,2", "2,1,2", "3,1,2"]
+        );
+    }
+
+    #[test]
+    fn globe_tiles_beyond_the_horizon_are_dropped() {
+        let viewport = deck_gl::View::Globe(deck_gl::GlobeViewProps::default()).make_viewport(
+            &deck_gl::AnyViewState::Globe(ViewState {
+                longitude: 0.0,
+                latitude: 0.0,
+                zoom: 2.0,
+                pitch: 0.0,
+                bearing: 0.0,
+            }),
+            400.0,
+            400.0,
+        );
+        let tiles = get_tile_indices(&viewport, &TilesetOptions::default());
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            let [west, _] = osm_tile_to_lng_lat(tile.x, tile.y, tile.z);
+            let [east, _] = osm_tile_to_lng_lat(tile.x + 1, tile.y + 1, tile.z);
+            assert!(
+                east > -90.0 && west < 90.0,
+                "tile {tile:?} ({west}..{east}) is on the far side of the globe"
+            );
+        }
     }
 
     #[test]
