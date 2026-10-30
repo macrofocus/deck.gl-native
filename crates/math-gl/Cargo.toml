@@ -1,6 +1,6 @@
 [package]
 name = "math-gl"
-description = "Rust port of math.gl: Web Mercator projection math for deck.gl-native"
+description = "Rust port of math.gl: Web Mercator projection and culling math for deck.gl-native"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
