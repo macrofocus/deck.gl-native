@@ -2403,6 +2403,14 @@ fn directional_lights_cast_shadows_onto_the_layers_below() {
     deck.set_lighting(lighting(false));
     let shot = deck.snapshot(None).unwrap();
     assert_eq!(shot.pixel(c + 10, c), plain);
+    // And turning them on once more brings the shadow back
+    deck.set_lighting(lighting(true));
+    let shot = deck.snapshot(None).unwrap();
+    assert_eq!(
+        shot.pixel(c + 10, c),
+        shadowed,
+        "shadows come back after being turned off"
+    );
     // A layer with shadowEnabled false casts nothing
     let mut deck = make_deck(
         &ctx,
@@ -2430,6 +2438,163 @@ fn directional_lights_cast_shadows_onto_the_layers_below() {
         shot.pixel(c + 10, c),
         plain,
         "a layer that casts no shadow leaves the ground alone"
+    );
+}
+
+#[test]
+fn the_shadow_pass_draws_without_polygon_offset() {
+    let Some(ctx) = context() else { return };
+    let deck = make_deck(&ctx, Vec::new());
+    let mut layer_ctx = deck.context().clone();
+    layer_ctx.layer_index = 3 * deck_gl::layer::LAYER_INDEX_STRIDE;
+    layer_ctx.depth_bias_base = -100;
+    assert_ne!(
+        layer_ctx.depth_bias().constant,
+        0,
+        "layers are offset in the main pass"
+    );
+    layer_ctx.shadow_pass = Some(0);
+    assert_eq!(
+        layer_ctx.depth_bias(),
+        wgpu::DepthBiasState::default(),
+        "the shadow map stores depths without the offset"
+    );
+}
+
+#[test]
+fn coplanar_layers_do_not_shadow_themselves_whatever_their_index() {
+    use deck_gl::{AmbientLight, DirectionalLight, LightingEffect};
+    let Some(ctx) = context() else { return };
+    // Coplanar ground tiles, one layer each, about 8 px wide: layers further down the list
+    // have a larger polygon offset, which must not reach the shadow map
+    let tile = 0.0006;
+    let center_of = |i: usize| {
+        [
+            CENTER[0] + ((i % 4) as f64 - 1.5) * tile,
+            CENTER[1] + (0.5 - (i / 4) as f64) * tile,
+        ]
+    };
+    let tiles = || -> Vec<Box<dyn Layer>> {
+        (0..8)
+            .map(|i| {
+                let [x, y] = center_of(i);
+                let r = tile / 2.0;
+                Box::new(SolidPolygonLayer::new(SolidPolygonLayerProps {
+                    base: LayerProps::new(format!("tile-{i}")),
+                    data: LayerData::with_length(1),
+                    get_polygon: Accessor::Constant(vec![vec![
+                        [x - r, y - r, 0.0],
+                        [x + r, y - r, 0.0],
+                        [x + r, y + r, 0.0],
+                        [x - r, y + r, 0.0],
+                    ]]),
+                    get_fill_color: Accessor::Constant([200, 200, 200, 255]),
+                    filled: true,
+                    extruded: false,
+                    ..Default::default()
+                })) as Box<dyn Layer>
+            })
+            .collect()
+    };
+    let lighting = |shadow: bool| LightingEffect {
+        ambient: AmbientLight {
+            color: [255.0, 255.0, 255.0],
+            intensity: 1.0,
+        },
+        directional: vec![DirectionalLight {
+            color: [255.0, 255.0, 255.0],
+            intensity: 1.0,
+            direction: [1.0, -0.5, -1.0],
+            shadow,
+        }],
+        point: Vec::new(),
+        shadow_color: [0.0, 0.0, 0.0, 1.0],
+    };
+    let mut deck = make_deck(&ctx, tiles());
+    deck.set_lighting(lighting(false));
+    let plain = deck.snapshot(None).unwrap();
+    deck.set_lighting(lighting(true));
+    let shot = deck.snapshot(None).unwrap();
+    let viewport = deck.viewport().clone();
+    for i in 0..8 {
+        let [x, y] = center_of(i);
+        let pixel = viewport.project(glam::DVec3::new(x, y, 0.0), true);
+        let (px, py) = (pixel.x.round() as u32, pixel.y.round() as u32);
+        assert_eq!(plain.pixel(px, py)[3], 255, "tile {i} is drawn");
+        assert_eq!(
+            shot.pixel(px, py),
+            plain.pixel(px, py),
+            "tile {i} is not in its own shadow"
+        );
+    }
+}
+
+#[test]
+fn lit_meshes_draw_their_depth_into_the_shadow_map_unlit() {
+    use deck_gl::{AmbientLight, DirectionalLight, LightingEffect};
+    use deck_gl_layers::{Mesh, SimpleMeshLayer, SimpleMeshLayerProps};
+    let Some(ctx) = context() else { return };
+    let d = 0.002;
+    let ground: Box<dyn Layer> = Box::new(SolidPolygonLayer::new(SolidPolygonLayerProps {
+        base: LayerProps {
+            material: Material::unlit(),
+            ..LayerProps::new("ground")
+        },
+        data: LayerData::with_length(1),
+        get_polygon: Accessor::Constant(vec![vec![
+            [CENTER[0] - d, CENTER[1] - d, 0.0],
+            [CENTER[0] + d, CENTER[1] - d, 0.0],
+            [CENTER[0] + d, CENTER[1] + d, 0.0],
+            [CENTER[0] - d, CENTER[1] + d, 0.0],
+        ]]),
+        get_fill_color: Accessor::Constant([255, 255, 255, 255]),
+        filled: true,
+        extruded: false,
+        ..Default::default()
+    }));
+    // SimpleMeshLayer lights its colour after DECKGL_FILTER_COLOR, where the shadow module
+    // writes the packed depth: lit, the stored depth would be scaled and the box would shadow
+    // its own top
+    let cube: Box<dyn Layer> = Box::new(SimpleMeshLayer::new(SimpleMeshLayerProps {
+        base: LayerProps::new("cube"),
+        data: LayerData::with_length(1),
+        mesh: Some(Arc::new(Mesh::cube())),
+        get_position: Accessor::Constant(CENTER),
+        get_color: Accessor::Constant([255, 255, 255, 255]),
+        get_scale: Accessor::Constant([40.0, 40.0, 60.0]),
+        get_translation: Accessor::Constant([0.0, 0.0, 30.0]),
+        ..Default::default()
+    }));
+    let lighting = |shadow: bool| LightingEffect {
+        ambient: AmbientLight {
+            color: [255.0, 255.0, 255.0],
+            intensity: 1.0,
+        },
+        directional: vec![DirectionalLight {
+            color: [255.0, 255.0, 255.0],
+            intensity: 0.0,
+            direction: [1.0, 0.0, -1.0],
+            shadow,
+        }],
+        point: Vec::new(),
+        shadow_color: [0.0, 0.0, 0.0, 1.0],
+    };
+    let mut deck = make_deck(&ctx, vec![ground, cube]);
+    deck.set_lighting(lighting(false));
+    let plain = deck.snapshot(None).unwrap();
+    deck.set_lighting(lighting(true));
+    let shot = deck.snapshot(None).unwrap();
+    let c = SIZE / 2;
+    assert_eq!(
+        shot.pixel(c, c),
+        plain.pixel(c, c),
+        "the top of the box is not in its own shadow"
+    );
+    let ground = plain.pixel(c + 12, c);
+    let shadowed = shot.pixel(c + 12, c);
+    assert!(
+        shadowed[0] < ground[0] - 30,
+        "the box shadows the ground east of it: {shadowed:?} against {ground:?}"
     );
 }
 
