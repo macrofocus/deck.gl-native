@@ -180,23 +180,47 @@ fn ortho_gl(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64) -
     )
 }
 
-/// The eight corners of the view frustum in common space: the ground plane (or the far
-/// plane off a map) and the near plane.
-fn frustum_corners(viewport: &Viewport) -> [DVec3; 8] {
+/// deck.gl's `getFrustumCorners`: the corners of the view frustum in common space. For
+/// geospatial viewports the frustum is clipped to z >= 0, since the visible geometry is
+/// assumed to be on or above the ground.
+fn frustum_corners(viewport: &Viewport) -> Vec<DVec3> {
     let (w, h) = (viewport.width, viewport.height);
-    let pixels = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)];
-    let far = if viewport.is_geospatial { None } else { Some(1.0) };
-    let mut corners = [DVec3::ZERO; 8];
-    for (i, (x, y)) in pixels.iter().enumerate() {
-        corners[i] = pixels_to_world(DVec2::new(*x, *y), far, &viewport.pixel_unprojection_matrix, 0.0);
-        corners[i + 4] = pixels_to_world(
-            DVec2::new(*x, *y),
-            Some(-1.0),
-            &viewport.pixel_unprojection_matrix,
-            0.0,
-        );
+    let screen_corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)];
+    let unproject = |z: f64| {
+        screen_corners.map(|(x, y)| {
+            pixels_to_world(
+                DVec2::new(x, y),
+                Some(z),
+                &viewport.pixel_unprojection_matrix,
+                0.0,
+            )
+        })
+    };
+    let near = unproject(-1.0);
+    let far = unproject(1.0);
+    let frustum = || near.iter().chain(far.iter()).copied();
+    if !viewport.is_geospatial {
+        return frustum().collect();
     }
-    corners
+
+    // Frustum vertices above the ground, plus the points where frustum edges cross the
+    // ground. At high pitch the far plane crosses the ground, so the visible area ends at the
+    // far plane instead of where the corner rays hit the ground.
+    let mut corners: Vec<DVec3> = frustum().filter(|corner| corner.z >= 0.0).collect();
+    for i in 0..4 {
+        let j = (i + 1) % 4;
+        for (a, b) in [(near[i], far[i]), (near[i], near[j]), (far[i], far[j])] {
+            if (a.z < 0.0) != (b.z < 0.0) {
+                let t = a.z / (a.z - b.z);
+                corners.push(DVec3::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, 0.0));
+            }
+        }
+    }
+    if corners.is_empty() {
+        frustum().collect()
+    } else {
+        corners
+    }
 }
 
 /// The size of the shadow maps for a deck of `width` x `height` logical pixels.
@@ -335,5 +359,81 @@ mod tests {
         assert_eq!(light_matrices(&lighting, &viewport).len(), 2);
         assert!(!shadows_enabled(&LightingEffect::default()));
         assert!(shadows_enabled(&lighting));
+    }
+
+    #[test]
+    fn light_matrices_cover_the_visible_ground_at_high_pitch() {
+        let (width, height) = (800.0, 600.0);
+        let lighting = LightingEffect {
+            directional: vec![DirectionalLight {
+                color: [255.0; 3],
+                intensity: 1.0,
+                direction: [1.0, -0.5, -1.0],
+                shadow: true,
+            }],
+            ..Default::default()
+        };
+        // With the default fov, the top edge of the viewport reaches the horizon at pitch ~71.6
+        for pitch in [60.0, 70.0, 72.0, 75.0, 80.0, 85.0] {
+            let viewport = Viewport::web_mercator(&WebMercatorViewportOptions {
+                width,
+                height,
+                longitude: -122.43,
+                latitude: 37.75,
+                zoom: 10.0,
+                pitch,
+                ..Default::default()
+            });
+            let matrix = light_matrices(&lighting, &viewport)[0];
+            let to_shadow_clip = |p: DVec3| {
+                let clip = matrix * (p - viewport.center).extend(1.0);
+                clip.truncate() / clip.w
+            };
+            let unproject = |x: f64, y: f64, z: f64| {
+                pixels_to_world(
+                    DVec2::new(x, y),
+                    Some(z),
+                    &viewport.pixel_unprojection_matrix,
+                    0.0,
+                )
+            };
+
+            // Every visible ground point is inside the shadow map
+            let (mut visible, mut covered) = (0, 0);
+            for y in (5..height as u32).step_by(50) {
+                for x in (5..width as u32).step_by(50) {
+                    let near = unproject(x as f64, y as f64, -1.0);
+                    let far = unproject(x as f64, y as f64, 1.0);
+                    let t = near.z / (near.z - far.z);
+                    if (0.0..=1.0).contains(&t) {
+                        visible += 1;
+                        let ground = near.lerp(far, t).truncate().extend(0.0);
+                        if to_shadow_clip(ground).abs().max_element() <= 1.0 + 1e-6 {
+                            covered += 1;
+                        }
+                    }
+                }
+            }
+            assert!(visible > 0, "pitch {pitch}: ground is visible");
+            assert_eq!(
+                covered, visible,
+                "pitch {pitch}: visible ground is in the shadow map"
+            );
+
+            // The shadow map is no larger than the view frustum
+            let corners: Vec<DVec3> = [(0.0, 0.0), (width, 0.0), (0.0, height), (width, height)]
+                .into_iter()
+                .flat_map(|(x, y)| [unproject(x, y, -1.0), unproject(x, y, 1.0)])
+                .map(to_shadow_clip)
+                .collect();
+            for axis in 0..2 {
+                let min = corners.iter().map(|c| c[axis]).fold(f64::INFINITY, f64::min);
+                let max = corners.iter().map(|c| c[axis]).fold(f64::NEG_INFINITY, f64::max);
+                assert!(
+                    min <= -1.0 + 1e-6 && max >= 1.0 - 1e-6,
+                    "pitch {pitch}: shadow map does not extend past the view frustum"
+                );
+            }
+        }
     }
 }

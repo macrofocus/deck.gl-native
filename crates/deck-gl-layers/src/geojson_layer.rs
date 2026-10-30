@@ -143,10 +143,18 @@ impl GeoJsonLayer {
         }
     }
 
-    fn sub_props(&self, suffix: &str) -> LayerProps {
+    /// The props of a sub layer whose geometry accessor is `geometry_accessor`. The
+    /// `geometry` transition goes to that accessor: geometry uses different accessor names in
+    /// point, path, and polygon sublayers.
+    fn sub_props(&self, suffix: &str, geometry_accessor: &str) -> LayerProps {
+        let mut transitions = self.props.base.transitions.clone();
+        if let Some(geometry) = transitions.get("geometry").copied() {
+            transitions = transitions.with(geometry_accessor, geometry);
+        }
         LayerProps {
             id: format!("{}-{suffix}", self.props.base.id),
             extensions: sub_layer_extensions(&self.props.base.extensions, suffix),
+            transitions,
             ..self.props.base.clone()
         }
     }
@@ -166,7 +174,7 @@ impl GeoJsonLayer {
             let rows = Arc::new(parts.polygons.iter().map(|(row, _)| *row).collect::<Vec<_>>());
             let polygons = Arc::new(parts.polygons.into_iter().map(|(_, p)| p).collect::<Vec<_>>());
             layers.push(Box::new(PolygonLayer::new(PolygonLayerProps {
-                base: self.sub_props("polygons"),
+                base: self.sub_props("polygons", "getPolygon"),
                 data: LayerData::with_length(polygons.len()).with_source_rows(rows.clone()),
                 stroked: props.stroked,
                 filled: props.filled,
@@ -191,7 +199,7 @@ impl GeoJsonLayer {
             let rows = Arc::new(parts.paths.iter().map(|(row, _)| *row).collect::<Vec<_>>());
             let paths = Arc::new(parts.paths.into_iter().map(|(_, p)| p).collect::<Vec<_>>());
             layers.push(Box::new(PathLayer::new(PathLayerProps {
-                base: self.sub_props("lines"),
+                base: self.sub_props("lines", "getPath"),
                 data: LayerData::with_length(paths.len()).with_source_rows(rows.clone()),
                 width_units: props.line_width_units,
                 width_scale: props.line_width_scale,
@@ -211,7 +219,7 @@ impl GeoJsonLayer {
             let rows = Arc::new(parts.points.iter().map(|(row, _)| *row).collect::<Vec<_>>());
             let points = Arc::new(parts.points.into_iter().map(|(_, p)| p).collect::<Vec<_>>());
             layers.push(Box::new(ScatterplotLayer::new(ScatterplotLayerProps {
-                base: self.sub_props("points"),
+                base: self.sub_props("points", "getPosition"),
                 data: LayerData::with_length(points.len()).with_source_rows(rows.clone()),
                 radius_units: props.point_radius_units,
                 radius_scale: props.point_radius_scale,
@@ -291,5 +299,45 @@ impl Layer for GeoJsonLayer {
             }
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use deck_gl::transition::{PropTransition, PropTransitions};
+
+    use super::*;
+
+    #[test]
+    fn geometry_transition_goes_to_each_sub_layer_geometry_accessor() {
+        let text = r#"{"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [0, 0]}},
+            {"type": "Feature", "properties": {},
+             "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]}},
+            {"type": "Feature", "properties": {},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}}
+        ]}"#;
+        let geometry = PropTransition::interpolation(300.0);
+        let color = PropTransition::interpolation(500.0);
+        let mut base = LayerProps::new("features");
+        base.transitions = PropTransitions::new()
+            .with("geometry", geometry)
+            .with("getFillColor", color);
+        let layer = GeoJsonLayer::new(GeoJsonLayerProps {
+            base,
+            data: Arc::new(FeatureCollection::parse(text).unwrap()),
+            ..Default::default()
+        });
+        let layers = layer.render_layers().unwrap();
+        let transition = |id: &str, accessor: &str| {
+            let layer = layers.iter().find(|l| l.props().id == id).unwrap();
+            layer.props().transitions.get(accessor).copied()
+        };
+        assert_eq!(transition("features-polygons", "getPolygon"), Some(geometry));
+        assert_eq!(transition("features-lines", "getPath"), Some(geometry));
+        assert_eq!(transition("features-points", "getPosition"), Some(geometry));
+        assert_eq!(transition("features-points", "getPath"), None);
+        // the other transitions go to every sub layer under their own names
+        assert_eq!(transition("features-polygons", "getFillColor"), Some(color));
     }
 }

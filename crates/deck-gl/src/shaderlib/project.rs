@@ -116,12 +116,19 @@ fn get_offset_origin(
 
     match viewport.projection_mode() {
         ProjectionMode::WebMercator => {
-            if matches!(
-                coordinate_system,
-                CoordinateSystem::LngLat | CoordinateSystem::Cartesian
-            ) {
+            if coordinate_system == CoordinateSystem::LngLat {
                 geospatial_origin = Some(DVec3::ZERO);
                 offset_mode = false;
+            } else if coordinate_system == CoordinateSystem::Cartesian {
+                // Positions are already in common space and only z is in meters. Use the viewport
+                // center as geospatial origin so that z is scaled the same as in
+                // WEB_MERCATOR_AUTO_OFFSET mode
+                offset_mode = false;
+                geospatial_origin = Some(viewport.unproject_position(DVec3::new(
+                    fround(viewport.center.x),
+                    fround(viewport.center.y),
+                    0.0,
+                )));
             }
         }
         ProjectionMode::WebMercatorAutoOffset => {
@@ -443,5 +450,59 @@ mod tests {
         let expected = viewport.project_position(DVec3::new(-122.45, 37.78, 0.0));
         assert!((u.common_origin.x - expected.x as f32).abs() < 1e-3);
         assert!((u.common_origin.y - expected.y as f32).abs() < 1e-3);
+    }
+
+    fn cartesian_uniforms(zoom: f64, position: Option<DVec3>) -> (ProjectUniforms, Viewport) {
+        let viewport = Viewport::web_mercator(&WebMercatorViewportOptions {
+            width: 800.0,
+            height: 600.0,
+            longitude: -122.19,
+            latitude: 46.2,
+            zoom,
+            pitch: 60.0,
+            position,
+            ..Default::default()
+        });
+        let u = get_uniforms_from_viewport(&ProjectProps {
+            viewport: &viewport,
+            device_pixel_ratio: 1.0,
+            model_matrix: None,
+            coordinate_system: CoordinateSystem::Cartesian,
+            coordinate_origin: DVec3::ZERO,
+            auto_wrap_longitude: false,
+            clip_depth_range: ClipDepthRange::default(),
+            clip_origin: ClipOrigin::default(),
+        });
+        (u, viewport)
+    }
+
+    #[test]
+    fn cartesian_z_scale_is_continuous_across_zoom_12() {
+        // Common space positions with z in meters, e.g. TerrainLayer meshes. Their z must be
+        // scaled at the viewport latitude in both WEB_MERCATOR (zoom < 12) and
+        // WEB_MERCATOR_AUTO_OFFSET (zoom >= 12) modes
+        for zoom in [11.99, 12.0] {
+            let (u, viewport) = cartesian_uniforms(zoom, None);
+            let units_per_meter = viewport.get_distance_scales(None).units_per_meter.z;
+            let z_ratio = u.common_units_per_world_unit.z as f64 / units_per_meter;
+            let size_ratio = u.common_units_per_meter.z as f64 / units_per_meter;
+            assert!((z_ratio - 1.0).abs() < 1e-6, "zoom {zoom}: z ratio {z_ratio}");
+            assert!(
+                (size_ratio - 1.0).abs() < 1e-6,
+                "zoom {zoom}: size ratio {size_ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn cartesian_z_scale_is_continuous_across_zoom_12_with_a_position_offset() {
+        // A north-south offset moves the viewport center away from the viewport latitude
+        let position = Some(DVec3::new(0.0, 100_000.0, 0.0));
+        let below = cartesian_uniforms(11.99, position)
+            .0
+            .common_units_per_world_unit
+            .z;
+        let above = cartesian_uniforms(12.0, position).0.common_units_per_world_unit.z;
+        assert!((above / below - 1.0).abs() < 1e-6, "{above} / {below}");
     }
 }
