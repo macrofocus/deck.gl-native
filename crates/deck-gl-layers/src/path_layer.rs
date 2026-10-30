@@ -12,6 +12,7 @@ use luma_gl::buffer::{create_index_buffer, create_vertex_buffer_from};
 use luma_gl::{Model, ModelDescriptor, VertexBufferLayout};
 use wgpu::VertexFormat;
 
+use crate::extensions::resolve_terrain_draw_mode;
 use crate::path::{tesselate, TesselatedPaths};
 
 pub(crate) const SHADER: &str = include_str!("wgsl/path_layer.wgsl");
@@ -79,7 +80,7 @@ pub struct PathLayer {
 impl PathLayer {
     pub fn new(props: PathLayerProps) -> Self {
         Self {
-            props,
+            props: Self::resolve(props),
             model: None,
             data_dirty: true,
             bounds: None,
@@ -92,7 +93,18 @@ impl PathLayer {
     }
 
     /// Replace the props. Attributes are rebuilt on the next update when they changed.
+    /// Paths drape over terrain, as in deck.gl: this layer's `instancePositions` are its
+    /// vertices, not anchors.
+    fn resolve(mut props: PathLayerProps) -> PathLayerProps {
+        if props.base.extensions.needs_terrain() {
+            props.base.extensions =
+                resolve_terrain_draw_mode(&props.base.extensions, deck_gl::TerrainDrawMode::Drape);
+        }
+        props
+    }
+
     pub fn set_props(&mut self, props: PathLayerProps) {
+        let props = Self::resolve(props);
         if self.props == props {
             return;
         }

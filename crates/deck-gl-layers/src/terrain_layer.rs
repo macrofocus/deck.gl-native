@@ -6,10 +6,14 @@
 //! ([`terrain_mesh`]); each tile is drawn by a [`SimpleMeshLayer`](crate::SimpleMeshLayer).
 //! With a plain URL and `bounds` a single mesh covers those bounds.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use deck_gl::{Accessor, Color, Layer, LayerContext, LayerData, LayerProps, Result, Viewport};
-use math_gl::web_mercator::lng_lat_to_world;
+use deck_gl::{
+    Accessor, Color, CoordinateSystem, Layer, LayerContext, LayerData, LayerProps, ProjectionMode, Result,
+    Viewport,
+};
+use math_gl::web_mercator::{lng_lat_to_world, world_to_lng_lat};
 
 use crate::terrain::{terrain_mesh, ElevationDecoder};
 use crate::tile_layer::{LoadedTile, TileData, TileLayer, TileLayerProps, TileLoader, TileRenderer};
@@ -19,8 +23,49 @@ use crate::{BitmapImage, Mesh, SimpleMeshLayer, SimpleMeshLayerProps};
 /// A loaded terrain tile: its mesh and the texture to drape over it.
 #[derive(Clone, Debug)]
 pub struct TerrainTile {
+    /// Positions in flat common space with z in metres, drawn as `CARTESIAN`
     pub mesh: Arc<Mesh>,
     pub texture: Option<BitmapImage>,
+    /// The mesh in longitudes and latitudes, made the first time a globe draws it
+    lng_lat_mesh: OnceLock<Arc<Mesh>>,
+}
+
+impl TerrainTile {
+    pub fn new(mesh: Arc<Mesh>, texture: Option<BitmapImage>) -> Self {
+        Self {
+            mesh,
+            texture,
+            lng_lat_mesh: OnceLock::new(),
+        }
+    }
+
+    /// The mesh to draw and its coordinate system. deck.gl bakes tile bounds with
+    /// `projectFlat`, which is the identity under a globe, so there the meshes are in
+    /// longitudes and latitudes and drawn as `LNGLAT`.
+    fn mesh_for(&self, globe: bool) -> (Arc<Mesh>, CoordinateSystem) {
+        if globe {
+            let mesh = self.lng_lat_mesh.get_or_init(|| Arc::new(to_lng_lat(&self.mesh)));
+            (mesh.clone(), CoordinateSystem::LngLat)
+        } else {
+            (self.mesh.clone(), CoordinateSystem::Cartesian)
+        }
+    }
+}
+
+/// A terrain mesh with its flat common space positions turned into longitudes and latitudes.
+fn to_lng_lat(mesh: &Mesh) -> Mesh {
+    let positions = mesh
+        .positions
+        .iter()
+        .map(|&[x, y, z]| {
+            let [lng, lat] = world_to_lng_lat([x as f64, y as f64]);
+            [lng as f32, lat as f32, z]
+        })
+        .collect();
+    Mesh {
+        positions,
+        ..mesh.clone()
+    }
 }
 
 /// Properties of a [`TerrainLayer`]. Defaults match deck.gl.
@@ -119,38 +164,47 @@ fn terrain_loader(props: &TerrainLayerProps) -> TileLoader {
                 rgba: Arc::new(image.into_raw()),
             })
         });
-        Ok(Some(Arc::new(TerrainTile {
-            mesh: Arc::new(mesh),
-            texture,
-        }) as TileData))
+        Ok(Some(
+            Arc::new(TerrainTile::new(Arc::new(mesh), texture)) as TileData
+        ))
     })
 }
 
-/// One `SimpleMeshLayer` per loaded tile, drawing its mesh in common space.
-fn terrain_renderer(props: &TerrainLayerProps) -> TileRenderer {
-    let color = props.color;
-    let wireframe = props.wireframe;
+/// The `SimpleMeshLayer` that draws one terrain mesh.
+fn mesh_layer(props: &TerrainLayerProps, id: String, tile: &TerrainTile, globe: bool) -> SimpleMeshLayer {
+    let (mesh, coordinate_system) = tile.mesh_for(globe);
+    SimpleMeshLayer::new(SimpleMeshLayerProps {
+        base: LayerProps {
+            id,
+            coordinate_system,
+            ..props.base.clone()
+        },
+        data: LayerData::with_length(1),
+        mesh: Some(mesh),
+        texture: tile.texture.clone(),
+        wireframe: props.wireframe,
+        // The mesh carries world positions, not offsets around an anchor
+        instanced: false,
+        get_position: Accessor::Constant([0.0, 0.0, 0.0]),
+        get_color: Accessor::Constant(props.color),
+        ..Default::default()
+    })
+}
+
+/// One `SimpleMeshLayer` per loaded tile, drawing its mesh in common space, or in longitudes
+/// and latitudes while `globe` is set.
+fn terrain_renderer(props: &TerrainLayerProps, globe: Arc<AtomicBool>) -> TileRenderer {
+    let props = props.clone();
     TileRenderer::new(move |tile: &LoadedTile, base: &LayerProps| {
         let Some(terrain) = tile.data::<TerrainTile>() else {
             return Vec::new();
         };
-        vec![Box::new(SimpleMeshLayer::new(SimpleMeshLayerProps {
-            base: LayerProps {
-                id: tile.sub_layer_id(&base.id, "mesh"),
-                // The mesh positions are already projected, deck.gl's `CARTESIAN`
-                coordinate_system: deck_gl::CoordinateSystem::Cartesian,
-                ..base.clone()
-            },
-            data: LayerData::with_length(1),
-            mesh: Some(terrain.mesh.clone()),
-            texture: terrain.texture.clone(),
-            wireframe,
-            // The mesh carries world positions, not offsets around an anchor
-            instanced: false,
-            get_position: Accessor::Constant([0.0, 0.0, 0.0]),
-            get_color: Accessor::Constant(color),
-            ..Default::default()
-        })) as Box<dyn Layer>]
+        let props = TerrainLayerProps {
+            base: base.clone(),
+            ..props.clone()
+        };
+        let id = tile.sub_layer_id(&base.id, "mesh");
+        vec![Box::new(mesh_layer(&props, id, terrain, globe.load(Ordering::Relaxed))) as Box<dyn Layer>]
     })
 }
 
@@ -161,9 +215,13 @@ pub struct TerrainLayer {
     tiles: Option<TileLayer>,
     /// A single mesh, when it is one image over `bounds`
     single: Option<SimpleMeshLayer>,
+    /// The loaded single mesh and its texture
+    single_tile: Option<TerrainTile>,
     /// Whether the single mesh has been loaded
     loaded: bool,
     dirty: bool,
+    /// Whether the meshes are drawn under a globe, in longitudes and latitudes
+    globe: Arc<AtomicBool>,
 }
 
 impl TerrainLayer {
@@ -172,8 +230,10 @@ impl TerrainLayer {
             props,
             tiles: None,
             single: None,
+            single_tile: None,
             loaded: false,
             dirty: true,
+            globe: Arc::new(AtomicBool::new(false)),
         };
         layer.rebuild();
         layer
@@ -213,13 +273,14 @@ impl TerrainLayer {
         self.dirty = true;
         self.tiles = None;
         self.single = None;
+        self.single_tile = None;
         self.loaded = false;
         if self.is_tiled() {
             let props = &self.props;
             self.tiles = Some(TileLayer::new(TileLayerProps {
                 base: props.base.clone(),
                 get_tile_data: Some(terrain_loader(props)),
-                render_sub_layers: terrain_renderer(props),
+                render_sub_layers: terrain_renderer(props, self.globe.clone()),
                 tile_size: props.tile_size,
                 min_zoom: props.min_zoom,
                 max_zoom: props.max_zoom,
@@ -269,22 +330,30 @@ impl TerrainLayer {
             }
         };
         let texture = props.texture.first().and_then(|url| load(url).ok());
-        self.single = Some(SimpleMeshLayer::new(SimpleMeshLayerProps {
-            base: LayerProps {
-                id: format!("{}-mesh", props.base.id),
-                coordinate_system: deck_gl::CoordinateSystem::Cartesian,
-                ..props.base.clone()
-            },
-            data: LayerData::with_length(1),
-            mesh: Some(Arc::new(mesh)),
-            texture,
-            wireframe: props.wireframe,
-            instanced: false,
-            get_position: Accessor::Constant([0.0, 0.0, 0.0]),
-            get_color: Accessor::Constant(props.color),
-            ..Default::default()
-        }));
+        self.single_tile = Some(TerrainTile::new(Arc::new(mesh), texture));
+        self.build_single();
         Ok(())
+    }
+
+    fn build_single(&mut self) {
+        self.single = self.single_tile.as_ref().map(|tile| {
+            let id = format!("{}-mesh", self.props.base.id);
+            mesh_layer(&self.props, id, tile, self.globe.load(Ordering::Relaxed))
+        });
+        self.dirty = true;
+    }
+
+    /// Follow the viewport between a map and a globe: the meshes change coordinate system.
+    fn set_globe(&mut self, globe: bool) {
+        if self.globe.swap(globe, Ordering::Relaxed) == globe {
+            return;
+        }
+        if let Some(tiles) = self.tiles.as_mut() {
+            tiles.rerender_sub_layers();
+        }
+        if self.single_tile.is_some() {
+            self.build_single();
+        }
     }
 }
 
@@ -298,6 +367,11 @@ impl Layer for TerrainLayer {
     }
 
     fn update(&mut self, ctx: &LayerContext, viewport: &Viewport) -> Result<()> {
+        // The terrain cover and height map passes draw through flat viewports; the meshes
+        // follow the screen's
+        if !ctx.terrain_cover_pass {
+            self.set_globe(viewport.projection_mode() == ProjectionMode::Globe);
+        }
         if let Some(tiles) = self.tiles.as_mut() {
             return tiles.update(ctx, viewport);
         }
@@ -342,6 +416,15 @@ impl Layer for TerrainLayer {
             single.draw_picking(ctx, pass)?;
         }
         Ok(())
+    }
+
+    /// The `[west, south, east, north]` of a single elevation image, which its terrain
+    /// cover fits; tiled terrain has none.
+    fn bounds(&self) -> Option<[f64; 4]> {
+        if self.is_tiled() {
+            return None;
+        }
+        self.props.bounds
     }
 
     fn set_highlighted_object(&mut self, index: Option<u32>) {

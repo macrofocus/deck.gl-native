@@ -459,6 +459,13 @@ impl TileLayer {
         changed
     }
 
+    /// Render the sub layers of every tile again, for a parent whose renderer now draws
+    /// them differently (another projection).
+    pub fn rerender_sub_layers(&mut self) {
+        self.sub_layers.clear();
+        self.dirty = true;
+    }
+
     /// Tiles queued or loading right now.
     pub fn loading_count(&self) -> usize {
         self.pool.as_ref().map_or(0, |pool| pool.tokens.len())

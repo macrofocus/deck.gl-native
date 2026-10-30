@@ -669,7 +669,7 @@ impl<'a> Props<'a> {
                 "CollisionFilterExtension" => extensions.push(Arc::new(self.collision_filter_extension()?)),
                 "FillStyleExtension" => extensions.push(Arc::new(self.fill_style_extension(&options)?)),
                 "PathStyleExtension" => extensions.push(Arc::new(self.path_style_extension(&options)?)),
-                "TerrainExtension" => extensions.push(Arc::new(deck_gl_layers::TerrainExtension::new())),
+                "TerrainExtension" => extensions.push(Arc::new(self.terrain_extension()?)),
                 "" => return Err(self.error("extensions", format!("each extension needs a {TYPE_KEY}"))),
                 other => self.warn(format!(
                     "extension `{other}` is not supported yet and was ignored"
@@ -703,6 +703,22 @@ impl<'a> Props<'a> {
             brushing_enabled: self.bool("brushingEnabled", defaults.brushing_enabled)?,
             brushing_radius: self.f32("brushingRadius", defaults.brushing_radius)?,
         })
+    }
+
+    /// The layer's `terrainDrawMode`, `offset` or `drape`; deduced from the layer without one.
+    fn terrain_extension(&self) -> Result<deck_gl_layers::TerrainExtension> {
+        let terrain_draw_mode = match self.string("terrainDrawMode")?.as_deref() {
+            None => None,
+            Some("offset") => Some(deck_gl::TerrainDrawMode::Offset),
+            Some("drape") => Some(deck_gl::TerrainDrawMode::Drape),
+            Some(other) => {
+                return Err(self.error(
+                    "terrainDrawMode",
+                    format!("expected `offset` or `drape`, got `{other}`"),
+                ))
+            }
+        };
+        Ok(deck_gl_layers::TerrainExtension { terrain_draw_mode })
     }
 
     fn clip_extension(&self) -> Result<ClipExtension> {

@@ -113,6 +113,10 @@ pub struct ModelDescriptor<'a> {
     /// with no depth buffer and no blending. Drawn instead of the main pipeline while
     /// [`Model::set_terrain_mode`] is on.
     pub terrain: bool,
+    /// Also build a terrain cover pipeline: same shader and blending, a [`COVER_FORMAT`]
+    /// target with no depth buffer. Drawn instead of the main pipeline while
+    /// [`Model::set_cover_mode`] is on.
+    pub cover: bool,
 }
 
 impl<'a> ModelDescriptor<'a> {
@@ -139,6 +143,7 @@ impl<'a> ModelDescriptor<'a> {
             cache: None,
             shadow: false,
             terrain: false,
+            cover: false,
         }
     }
 }
@@ -153,6 +158,9 @@ pub const SHADOW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth2
 
 /// Format of the terrain height map: metres in the red channel.
 pub const HEIGHT_MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Format of a terrain cover: the draped layers' colours, premultiplied.
+pub const COVER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Blend state of deck.gl's picking pass: color written as is, alpha replaced by the blend
 /// constant, which the pass sets to the layer's id.
@@ -210,6 +218,9 @@ pub struct Model {
     terrain_pipeline: Option<wgpu::RenderPipeline>,
     /// Draw with the terrain pipeline, see [`Model::set_terrain_mode`]
     terrain_mode: bool,
+    cover_pipeline: Option<wgpu::RenderPipeline>,
+    /// Draw with the cover pipeline, see [`Model::set_cover_mode`]
+    cover_mode: bool,
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     bind_group_dirty: bool,
@@ -436,6 +447,16 @@ impl Model {
                 None,
             )
         });
+        // A terrain cover blends the draped layers like the screen does, without depth
+        let cover_pipeline = desc.cover.then(|| {
+            make_pipeline(
+                &format!("{}:cover", desc.label),
+                COVER_FORMAT,
+                desc.blend,
+                1,
+                None,
+            )
+        });
 
         Ok(Self {
             label: desc.label.to_string(),
@@ -446,6 +467,8 @@ impl Model {
             shadow_mode: false,
             terrain_pipeline,
             terrain_mode: false,
+            cover_pipeline,
+            cover_mode: false,
             bind_group_layout,
             bind_group,
             bind_group_dirty: false,
@@ -651,10 +674,15 @@ impl Model {
 
     /// Encode this model's draw call into the pass.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> Result<()> {
-        // The height map and shadow passes draw with their own pipelines
-        let pipeline = match (&self.terrain_pipeline, &self.shadow_pipeline) {
-            (Some(terrain), _) if self.terrain_mode => terrain,
-            (_, Some(shadow)) if self.shadow_mode => shadow,
+        // The height map, terrain cover and shadow passes draw with their own pipelines
+        let pipeline = match (
+            &self.terrain_pipeline,
+            &self.cover_pipeline,
+            &self.shadow_pipeline,
+        ) {
+            (Some(terrain), _, _) if self.terrain_mode => terrain,
+            (_, Some(cover), _) if self.cover_mode => cover,
+            (_, _, Some(shadow)) if self.shadow_mode => shadow,
             _ => &self.pipeline,
         };
         self.draw_with(pipeline, pass)
@@ -668,6 +696,21 @@ impl Model {
 
     pub fn has_terrain_pipeline(&self) -> bool {
         self.terrain_pipeline.is_some()
+    }
+
+    /// Draw with the terrain cover pipeline (see [`ModelDescriptor::cover`]) until turned
+    /// off. A model without one keeps drawing with its main pipeline.
+    pub fn set_cover_mode(&mut self, on: bool) {
+        self.cover_mode = on;
+    }
+
+    pub fn has_cover_pipeline(&self) -> bool {
+        self.cover_pipeline.is_some()
+    }
+
+    /// Whether the model has a vertex buffer slot of this name.
+    pub fn has_vertex_slot(&self, name: &str) -> bool {
+        self.slot_names.contains(&name)
     }
 
     /// Draw with the shadow pipeline (see [`ModelDescriptor::shadow`]) until turned off. A

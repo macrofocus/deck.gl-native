@@ -20,7 +20,10 @@ use crate::post_process::{PostProcessEffect, PostProcessor};
 use crate::shadow::{
     light_matrices, shadow_map_size, shadow_shaders, shadows_enabled, ShadowState, ShadowTarget,
 };
-use crate::terrain::{create_height_map, height_map_bounds, TerrainMap, HEIGHT_MAP_TARGET};
+use crate::terrain::{
+    cover_bounds, cover_viewport, create_height_map, height_map_bounds, TerrainCover, TerrainMap,
+    COVER_TARGET, HEIGHT_MAP_TARGET,
+};
 use crate::transition::{TransitionProps, ViewStateTransition};
 use crate::viewport::Viewport;
 use std::collections::HashMap;
@@ -195,6 +198,8 @@ pub struct Deck {
     post_processor: PostProcessor,
     /// The height map of the ground, kept across frames
     height_map: Option<wgpu::Texture>,
+    /// The terrain cover texture of each terrain layer, by layer id
+    cover_textures: HashMap<String, wgpu::Texture>,
     /// The ground of the current frame, shared with the layer context
     terrain: Arc<TerrainMap>,
     /// One shadow map per light that casts shadows, kept across frames
@@ -235,6 +240,7 @@ impl Deck {
             shadow_pass: None,
             terrain: None,
             terrain_pass: false,
+            terrain_cover_pass: false,
         };
         let camera = match props.view {
             View::Globe(_) => AnyViewState::Globe(props.view_state),
@@ -276,6 +282,7 @@ impl Deck {
             post_process: props.post_process,
             post_processor: PostProcessor::default(),
             height_map: None,
+            cover_textures: HashMap::new(),
             terrain: crate::terrain::empty_map(device, queue),
             shadow_targets: Vec::new(),
             shadow_dummy: create_rgba8_texture(device, queue, "shadow fallback", 1, 1, &[255, 255, 255, 255])
@@ -1060,7 +1067,8 @@ impl Deck {
             .collect();
         let bounds = height_map_bounds(&self.viewport);
         if ground.is_empty() {
-            self.publish_terrain(None, bounds);
+            self.cover_textures.clear();
+            self.publish_terrain(None, bounds, HashMap::new());
             return Ok(());
         }
         let device = &self.ctx.device;
@@ -1072,7 +1080,7 @@ impl Deck {
         self.ctx.clip_origin = ClipOrigin::default();
         self.ctx.uniform_slot = 0;
         // The bounds have to be in place before the layers write their uniforms
-        self.publish_terrain(None, bounds);
+        self.publish_terrain(None, bounds, HashMap::new());
         let mut encoder = self
             .ctx
             .device
@@ -1109,17 +1117,164 @@ impl Deck {
         self.ctx.queue.submit([encoder.finish()]);
         self.ctx.terrain_pass = false;
         self.ctx.target = main_target;
-        self.publish_terrain(Some(view), bounds);
-        // The ground layers wrote height map uniforms; write the frame's again
+        self.publish_terrain(Some(view.clone()), bounds, HashMap::new());
+        let covers = self.update_terrain_covers(&ground)?;
+        self.publish_terrain(Some(view), bounds, covers);
+        // The ground and draped layers wrote uniforms of their passes; write the frame's again
         self.update_layers(false)
     }
 
-    fn publish_terrain(&mut self, view: Option<wgpu::TextureView>, bounds: [f32; 4]) {
+    /// deck.gl's `TerrainEffect._updateTerrainCovers`: for every terrain layer that is drawn,
+    /// render the draped layers into a texture through an unpitched viewport over the
+    /// terrain's part of the world. The terrain layer then shows the texture on its surface.
+    fn update_terrain_covers(&mut self, ground: &[usize]) -> Result<HashMap<usize, TerrainCover>> {
+        let mut covers = HashMap::new();
+        let draped: Vec<usize> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                let props = e.layer.props();
+                e.initialized
+                    && props.visible
+                    && props.operation.draw
+                    && !props.operation.terrain
+                    && props.extensions.needs_terrain()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let targets: Vec<usize> = ground
+            .iter()
+            .copied()
+            .filter(|&i| self.layers[i].layer.props().operation.draw)
+            .collect();
+        if draped.is_empty() || targets.is_empty() {
+            self.cover_textures.clear();
+            return Ok(covers);
+        }
+        let main_target = self.ctx.target;
+        let dpr = self.ctx.device_pixel_ratio;
+        self.ctx.target = COVER_TARGET;
+        self.ctx.device_pixel_ratio = 1.0;
+        self.ctx.terrain_cover_pass = true;
+        self.ctx.uniform_slot = 0;
+        self.ctx.clip_origin = ClipOrigin::default();
+        let zoom = (self.viewport.zoom + 0.5).ceil();
+        let mut used = Vec::new();
+        let result = (|| -> Result<()> {
+            for &g in &targets {
+                let (id, layer_bounds) = {
+                    let layer = &self.layers[g].layer;
+                    (layer.id().to_string(), self.flat_layer_bounds(layer.as_ref()))
+                };
+                let bounds = cover_bounds(layer_bounds, &self.viewport);
+                let Some((cover_viewport, [x0, y0, x1, y1])) = cover_viewport(bounds, zoom, &self.viewport)
+                else {
+                    continue;
+                };
+                let size = (cover_viewport.width as u32, cover_viewport.height as u32);
+                let device = &self.ctx.device;
+                let texture = self
+                    .cover_textures
+                    .entry(id.clone())
+                    .and_modify(|t| {
+                        if (t.width(), t.height()) != size {
+                            *t =
+                                create_render_texture(device, &id, size.0, size.1, COVER_TARGET.color_format);
+                        }
+                    })
+                    .or_insert_with(|| {
+                        create_render_texture(device, &id, size.0, size.1, COVER_TARGET.color_format)
+                    });
+                let view = texture.create_view(&Default::default());
+                used.push(id);
+                // Each cover has its own viewport, so its uniforms go out with their own submit
+                for &i in &draped {
+                    self.ctx.layer_index = i as u32 * LAYER_INDEX_STRIDE;
+                    self.layers[i].layer.update(&self.ctx, &cover_viewport)?;
+                }
+                let mut encoder = self
+                    .ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("deck.gl terrain cover"),
+                    });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("deck.gl terrain cover"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    for &i in &draped {
+                        self.ctx.layer_index = i as u32 * LAYER_INDEX_STRIDE;
+                        self.layers[i].layer.draw(&self.ctx, &mut pass)?;
+                    }
+                }
+                self.ctx.queue.submit([encoder.finish()]);
+                covers.insert(
+                    g,
+                    TerrainCover {
+                        view,
+                        bounds: [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32],
+                    },
+                );
+            }
+            Ok(())
+        })();
+        self.ctx.terrain_cover_pass = false;
+        self.ctx.target = main_target;
+        self.ctx.device_pixel_ratio = dpr;
+        self.cover_textures.retain(|id, _| used.contains(id));
+        result.map(|()| covers)
+    }
+
+    /// A layer's bounds in absolute flat common space, for layers in longitudes and
+    /// latitudes; `None` for other coordinate systems and layers without bounds.
+    fn flat_layer_bounds(&self, layer: &dyn Layer) -> Option<[f64; 4]> {
+        let props = layer.props();
+        if !self.viewport.is_geospatial
+            || !matches!(
+                props.coordinate_system,
+                CoordinateSystem::Default | CoordinateSystem::LngLat
+            )
+        {
+            return None;
+        }
+        layer.bounds().map(|b| {
+            let bl = math_gl::web_mercator::lng_lat_to_world([b[0], b[1]]);
+            let tr = math_gl::web_mercator::lng_lat_to_world([b[2], b[3]]);
+            [
+                bl[0].min(tr[0]),
+                bl[1].min(tr[1]),
+                bl[0].max(tr[0]),
+                bl[1].max(tr[1]),
+            ]
+        })
+    }
+
+    fn publish_terrain(
+        &mut self,
+        view: Option<wgpu::TextureView>,
+        bounds: [f32; 4],
+        covers: HashMap<usize, TerrainCover>,
+    ) {
         self.terrain = Arc::new(TerrainMap {
             view,
             dummy: self.terrain.dummy.clone(),
             sampler: self.terrain.sampler.clone(),
             bounds,
+            covers,
         });
         self.ctx.terrain = Some(self.terrain.clone());
     }
