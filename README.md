@@ -134,7 +134,7 @@ layer and JSON crates, `--no-default-features` to leave out the parts with no wa
 (`fetch`, which pulls ring through ureq, and `s2-cells`). The browser is deck.gl JS's home,
 so this is a compile check rather than a supported target.
 
-Shader sources under `src/wgsl` in each crate are copied from deck.gl 9.4 and luma.gl (MIT).
+Shader sources under `src/wgsl` in each crate are copied from deck.gl 9.4.1 and luma.gl (MIT).
 
 ## Building and running
 

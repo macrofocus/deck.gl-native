@@ -28,7 +28,7 @@ was the same idea applied to deck.gl 8.
 
 **Shaders are deck.gl's WGSL, included verbatim.** `project`, `project32`, `picking`, the
 `geometry`, `color` and `layer` modules, luma.gl's `lighting` and `gouraudMaterial`, and the
-three layer shaders are copied from deck.gl 9.4 with only their generated headers expanded and
+three layer shaders are copied from deck.gl 9.4.1 with only their generated headers expanded and
 `@binding(auto)` resolved. Uniform block layouts are read back from the assembled WGSL with
 naga, so there are no hand-maintained `#[repr(C)]` mirrors to drift out of sync.
 

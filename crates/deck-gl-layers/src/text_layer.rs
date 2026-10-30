@@ -673,8 +673,12 @@ impl Layer for TextLayer {
         }
         let outline_buffer = self.outline_buffer();
         let base = self.props.base.clone();
-        // the characters sit above the background, like deck.gl's sub layer order
-        let character_bias = ctx.depth_bias().constant - 100;
+        // the characters sit above the background, like deck.gl's sub layer order, except in
+        // a shadow map, which is drawn without polygon offsets
+        let character_bias = match ctx.shadow_pass {
+            Some(_) => 0,
+            None => ctx.depth_bias().constant - 100,
+        };
         if let Some(mut model) = self.characters.take() {
             update_standard_uniforms(&mut model, ctx, viewport, &base)?;
             set_depth_bias(&mut model, character_bias)?;
