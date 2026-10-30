@@ -35,17 +35,17 @@ fontdue = { workspace = true }
 arrow-array = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true, features = ["jpeg"] }
-h3o = { version = "0.8", features = ["geo"] }
-s2 = { version = "0.0.12", optional = true }
+h3o = { version = "0.11", features = ["geo"] }
+s2 = { version = "0.2", optional = true }
 flate2 = "1"
 rayon = { workspace = true, optional = true }
 gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
-base64 = "0.22"
-a5 = "0.10"
+base64 = "0.23"
+a5 = "1"
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.8", default-features = false }
 
 [[bench]]
 name = "layers"

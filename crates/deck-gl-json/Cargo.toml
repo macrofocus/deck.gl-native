@@ -41,7 +41,7 @@ flatgeobuf = { workspace = true, optional = true }
 geozero = { workspace = true, optional = true }
 
 [dev-dependencies]
-a5 = "0.10"
+a5 = "1"
 arrow-schema = { workspace = true }
 parquet = { workspace = true }
 flatgeobuf = { workspace = true }

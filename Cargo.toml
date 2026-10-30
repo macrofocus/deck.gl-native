@@ -31,11 +31,11 @@ deck-gl-json = { path = "crates/deck-gl-json" }
 
 wgpu = "30"
 naga = { version = "30", features = ["wgsl-in", "glsl-out"] }
-glam = "0.33"
+glam = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
 regex = "1"
 thiserror = "2"
-pollster = "0.4"
+pollster = "1"
 # `std::time::Instant` panics on wasm32; this is `std::time` everywhere else and
 # `performance.now()` in a browser.
 web-time = "1"
@@ -43,12 +43,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 tracing = { version = "0.1", features = ["log"] }
 rayon = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-arrow-array = "59"
-arrow-schema = "59"
-arrow-buffer = "59"
-arrow-select = "59"
-arrow-ipc = "59"
-parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "brotli", "flate2-zlib-rs"] }
+arrow-array = "60"
+arrow-schema = "60"
+arrow-buffer = "60"
+arrow-select = "60"
+arrow-ipc = "60"
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "brotli", "flate2-zlib-rs"] }
 flatgeobuf = { version = "6", default-features = false }
 geozero = { version = "0.15", default-features = false, features = ["with-geojson"] }
 earcutr = "0.5"

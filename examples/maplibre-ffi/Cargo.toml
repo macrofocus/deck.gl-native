@@ -19,7 +19,7 @@ deck-gl-examples = { path = ".." }
 maplibre-native-ffi = { path = "../../../maplibre-native-ffi/bindings/rust/crates/maplibre-native-ffi", features = ["metal"] }
 wgpu = "30"
 winit = "0.30"
-pollster = "0.4"
+pollster = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
