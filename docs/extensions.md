@@ -145,12 +145,26 @@ for extensions that declare attributes.
 
 ## TerrainExtension
 
-A layer with `TerrainExtension` sits on the ground rather than at its own z. The ground comes
+A layer with `TerrainExtension` follows the ground rather than its own z. The ground comes
 from the layers whose `operation` is `Operation::TERRAIN` (drawn as well) or
-`Operation::TERRAIN_ONLY` (ground only): before the frame is drawn, the deck renders their
-elevation into a height map covering the view, in metres, and every layer with the extension
-looks its anchor up in that map and moves up by what it finds. Objects outside the map keep
-their own elevation.
+`Operation::TERRAIN_ONLY` (ground only). The extension's `terrain_draw_mode` says how a layer
+meets it, as deck.gl's `terrainDrawMode` does; without one it is deduced from the layer:
+
+- `TerrainDrawMode::Offset`, for layers with an anchor per object (scatterplots, icons, text,
+  columns, meshes, arcs) and extruded polygons: before the frame is drawn, the deck renders
+  the ground's elevation into a height map covering the view, in metres, and every object
+  looks its anchor up in that map and moves up by what it finds. Objects outside the map keep
+  their own elevation.
+- `TerrainDrawMode::Drape`, for paths, flat polygons, lines and bitmaps: the deck renders the
+  layer into a cover texture for each terrain layer that is drawn, through a flat viewport
+  over that layer's part of the world (up to twice the view, at most 2048 pixels a side), and
+  the terrain layer shows the cover on its surface. A draped layer is not drawn on its own, so
+  over `TERRAIN_ONLY` ground it does not show. Draped layers are not picked yet.
+
+Both modes work under a globe: maps and covers are laid out in flat Mercator space, and the
+terrain shader flattens sphere positions before looking them up, as deck.gl 9.4.1 does. On a
+globe `TerrainLayer` draws its meshes in longitudes and latitudes, and its tiles are chosen
+with deck.gl's globe traversal.
 
 ```rust
 let ground = TerrainLayer::new(TerrainLayerProps {
@@ -169,5 +183,5 @@ let points = ScatterplotLayer::new(ScatterplotLayerProps {
 });
 ```
 
-deck.gl's other terrain mode, draping a layer's pixels onto the terrain through a cover
-texture, is not here yet.
+In JSON, `terrainDrawMode` goes on the layer, next to `"extensions": [{"@@type":
+"TerrainExtension"}]`.

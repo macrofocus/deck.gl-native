@@ -1377,6 +1377,35 @@ fn terrain_operations_and_the_terrain_extension() {
         "terrain+draw is drawn as well"
     );
     assert!(deck.layers[2].props().extensions.needs_terrain());
+    // The layer's terrainDrawMode picks how the extension meets the ground
+    let mode = |layer: serde_json::Value| {
+        let deck = JsonConverter::new().convert(&json!([layer])).unwrap();
+        let extension = deck.layers[0]
+            .props()
+            .extensions
+            .get::<deck_gl_layers::TerrainExtension>()
+            .copied();
+        extension.and_then(|e| e.terrain_draw_mode)
+    };
+    let scatterplot = |extra: serde_json::Value| {
+        let mut layer =
+            json!({"@@type": "ScatterplotLayer", "data": [], "extensions": [{"@@type": "TerrainExtension"}]});
+        layer
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        layer
+    };
+    assert_eq!(mode(scatterplot(json!({}))), None, "deduced from the layer");
+    assert_eq!(
+        mode(scatterplot(json!({"terrainDrawMode": "drape"}))),
+        Some(deck_gl::TerrainDrawMode::Drape)
+    );
+    let error = JsonConverter::new()
+        .convert(&json!([scatterplot(json!({"terrainDrawMode": "float"}))]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("terrainDrawMode"), "{error}");
     // An operation that is not one of deck.gl's is an error
     let bad = json!([{"@@type": "ScatterplotLayer", "data": [], "operation": "levitate"}]);
     let error = JsonConverter::new().convert(&bad).unwrap_err().to_string();

@@ -67,8 +67,8 @@ deduplication and cancellation.
 **Rendering.** deck.gl's own `project` and `project32` WGSL, lighting with a per layer
 material, shadows from directional lights, eighteen post-processing passes, per layer blend and
 depth state, and multisampling. Shader hooks and eight layer extensions: data filter, brushing,
-clip, mask, collision filter, fill style, path style and terrain (layers sitting on ground
-that other layers draw)
+clip, mask, collision filter, fill style, path style and terrain (layers sitting on, or
+draped over, ground that other layers draw, on a map or a globe)
 ([docs/extensions.md](docs/extensions.md)).
 
 **Embedding.** Render into a wgpu pass you own or into textures you provide. A C API
@@ -83,8 +83,7 @@ for iOS and for `wasm32-unknown-unknown`.
 PNG, logging goes through `tracing`, and criterion benchmarks cover the large layers
 ([docs/benchmarks.md](docs/benchmarks.md)).
 
-Not yet: point cloud (`pnts`) tiles in `Tile3DLayer`, draping layers over terrain (the other
-half of `TerrainExtension`), Python, Swift and Kotlin bindings, golden image comparisons
+Not yet: point cloud (`pnts`) tiles in `Tile3DLayer`, picking draped layers, Python, Swift and Kotlin bindings, golden image comparisons
 against deck.gl JS, and published crates. See [docs/rust-port.md](docs/rust-port.md) for the
 design and the open decisions, and the [roadmap issue](https://github.com/birkskyum/deck.gl-native/issues/75)
 for what is planned.

@@ -12,6 +12,7 @@ use luma_gl::buffer::{create_index_buffer, create_vertex_buffer_from, split_f64}
 use luma_gl::{Model, ModelDescriptor, ShaderModuleSource, VertexBufferLayout};
 use wgpu::VertexFormat;
 
+use crate::extensions::resolve_terrain_draw_mode;
 use crate::polygon::tesselate;
 
 const COMMON: &str = include_str!("wgsl/solid_polygon_layer_common.wgsl");
@@ -99,7 +100,7 @@ pub struct SolidPolygonLayer {
 impl SolidPolygonLayer {
     pub fn new(props: SolidPolygonLayerProps) -> Self {
         Self {
-            props,
+            props: Self::resolve(props),
             top: None,
             side: None,
             wireframe: None,
@@ -116,7 +117,22 @@ impl SolidPolygonLayer {
     }
 
     /// Replace the props. Attributes are rebuilt on the next update when they changed.
+    /// Extruded polygons are 3D: on terrain they move up by the ground's height (offset) rather
+    /// than being draped, as deck.gl deduces from `extruded`.
+    fn resolve(mut props: SolidPolygonLayerProps) -> SolidPolygonLayerProps {
+        if props.base.extensions.needs_terrain() {
+            let mode = if props.extruded {
+                deck_gl::TerrainDrawMode::Offset
+            } else {
+                deck_gl::TerrainDrawMode::Drape
+            };
+            props.base.extensions = resolve_terrain_draw_mode(&props.base.extensions, mode);
+        }
+        props
+    }
+
     pub fn set_props(&mut self, props: SolidPolygonLayerProps) {
+        let props = Self::resolve(props);
         if self.props == props {
             return;
         }

@@ -252,6 +252,8 @@ pub struct LayerContext {
     pub terrain: Option<Arc<crate::terrain::TerrainMap>>,
     /// While the deck draws the terrain height map.
     pub terrain_pass: bool,
+    /// While the deck draws the terrain covers, the draped layers through a flat viewport.
+    pub terrain_cover_pass: bool,
 }
 
 /// Attachments of the mask pass: one red channel texture and no depth buffer.
@@ -299,6 +301,8 @@ impl LayerContext {
         desc.shadow = self.shadow_enabled && props.shadow_enabled && !props.operation.mask;
         // Ground layers also draw into the terrain height map, which has its own format
         desc.terrain = self.terrain.is_some() && props.operation.terrain;
+        // Draped layers also draw into the terrain covers
+        desc.cover = self.terrain.is_some() && props.extensions.needs_terrain();
         // the depth bias is a uniform, see `depth_bias`
         desc.depth_bias = wgpu::DepthBiasState::default();
         // the collision pass draws layers with their picking pipeline

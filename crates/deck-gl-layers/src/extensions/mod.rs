@@ -17,7 +17,7 @@ pub use data_filter::{DataFilterExtension, FilterCategories, FilterValues};
 pub use fill_style::{FillPattern, FillPatternAtlas, FillStyleExtension};
 pub use mask::MaskExtension;
 pub use path_style::{PathStyleExtension, PathStyleTarget};
-pub use terrain::TerrainExtension;
+pub use terrain::{resolve_terrain_draw_mode, TerrainExtension};
 
 use deck_gl::Extensions;
 

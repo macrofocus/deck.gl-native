@@ -60,7 +60,7 @@ pub use post_process::{
     builtin_module, PassKind, PassSpec, PostProcessEffect, ShaderPassModule, UniformValue,
 };
 pub use shadow::{light_matrices, shadow_shaders, shadows_enabled, ShadowState, ShadowTarget};
-pub use terrain::{terrain_shaders, TerrainMap, TerrainMode};
+pub use terrain::{terrain_shaders, TerrainCover, TerrainDrawMode, TerrainMap, TerrainMode};
 pub use transition::{
     EasingKind, PropTransition, PropTransitions, TransitionDuration, TransitionInterpolator,
     TransitionInterruption, TransitionProps, ViewStateTransition,
